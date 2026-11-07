@@ -233,7 +233,8 @@ export async function fetchOrderById(id: string, token?: string): Promise<Order 
   try {
     const url = token ? `/api/orders/${id}?token=${encodeURIComponent(token)}` : `/api/orders/${id}`;
     const res = await fetch(url);
-    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    if (!res.ok || !ct.includes('application/json')) return null;
     const data = await res.json();
     return data.order;
   } catch {
@@ -348,19 +349,28 @@ export async function fetchAdminOrders(): Promise<Order[]> {
       .select('*')
       .order('created_at', { ascending: false });
 
-    if (!error && data) {
+    if (!error && Array.isArray(data)) {
       return data.map(rowToOrder);
     }
-  } catch {
-    // fallback to API
+    if (error) {
+      console.warn('[Supabase fetchAdminOrders warning]', error.message);
+    }
+  } catch (err) {
+    console.warn('[Supabase fetchAdminOrders error]', err);
   }
 
-  const res = await fetch('/api/admin/orders');
-  if (!res.ok) {
-    throw new Error('Failed to fetch admin orders');
+  try {
+    const res = await fetch('/api/admin/orders');
+    const ct = res.headers.get('content-type') || '';
+    if (res.ok && ct.includes('application/json')) {
+      const data = await res.json();
+      return Array.isArray(data.orders) ? data.orders : [];
+    }
+  } catch {
+    // backend not available
   }
-  const data = await res.json();
-  return data.orders || [];
+
+  return [];
 }
 
 /**
@@ -380,8 +390,11 @@ export async function updateAdminOrderStatus(orderId: string, status: OrderStatu
       notifyOrderChange('STATUS_CHANGE', { orderId, status });
       return order;
     }
-  } catch {
-    // fallback to API
+    if (error) {
+      console.warn('[Supabase update status warning]', error.message);
+    }
+  } catch (err) {
+    console.warn('[Supabase update status error]', err);
   }
 
   const res = await fetch(`/api/admin/orders/${orderId}/status`, {
@@ -390,14 +403,14 @@ export async function updateAdminOrderStatus(orderId: string, status: OrderStatu
     body: JSON.stringify({ status }),
   });
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Failed to update order status' }));
-    throw new Error(err.error || 'Failed to update status');
+  const ct = res.headers.get('content-type') || '';
+  if (res.ok && ct.includes('application/json')) {
+    const data = await res.json();
+    notifyOrderChange('STATUS_CHANGE', { orderId, status });
+    return data.order;
   }
 
-  const data = await res.json();
-  notifyOrderChange('STATUS_CHANGE', { orderId, status });
-  return data.order;
+  throw new Error('Failed to update status');
 }
 
 /**
@@ -417,8 +430,11 @@ export async function markAdminPaymentReceived(orderId: string): Promise<Order> 
       notifyOrderChange('PAYMENT_RECEIVED', { orderId });
       return order;
     }
-  } catch {
-    // fallback to API
+    if (error) {
+      console.warn('[Supabase mark payment warning]', error.message);
+    }
+  } catch (err) {
+    console.warn('[Supabase mark payment error]', err);
   }
 
   const res = await fetch(`/api/admin/orders/${orderId}/payment-received`, {
@@ -426,35 +442,70 @@ export async function markAdminPaymentReceived(orderId: string): Promise<Order> 
     headers: { 'Content-Type': 'application/json' },
   });
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Failed to mark payment received' }));
-    throw new Error(err.error || 'Failed to update payment status');
+  const ct = res.headers.get('content-type') || '';
+  if (res.ok && ct.includes('application/json')) {
+    const data = await res.json();
+    notifyOrderChange('PAYMENT_RECEIVED', { orderId });
+    return data.order;
   }
 
-  const data = await res.json();
-  notifyOrderChange('PAYMENT_RECEIVED', { orderId });
-  return data.order;
+  throw new Error('Failed to update payment status');
 }
 
 /**
- * Real-time Supabase subscription for instant live updates across devices
+ * Shared singleton Real-time Supabase subscription across components
+ * Prevents "cannot add postgres_changes callbacks after subscribe" error
  */
+const orderListeners = new Set<(order: Order) => void>();
+let globalRealtimeChannel: ReturnType<typeof supabase.channel> | null = null;
+
 export function subscribeToLiveOrders(onOrderUpdate: (order: Order) => void): () => void {
-  const channel = supabase
-    .channel('public_orders_realtime')
-    .on(
-      'postgres_changes',
-      { event: '*', schema: 'public', table: 'orders' },
-      (payload) => {
-        if (payload.new) {
-          onOrderUpdate(rowToOrder(payload.new));
-        }
-      }
-    )
-    .subscribe();
+  orderListeners.add(onOrderUpdate);
+
+  if (!globalRealtimeChannel) {
+    try {
+      globalRealtimeChannel = supabase
+        .channel('public_orders_realtime_shared')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'orders' },
+          (payload) => {
+            if (payload && payload.new) {
+              try {
+                const order = rowToOrder(payload.new);
+                orderListeners.forEach((cb) => {
+                  try {
+                    cb(order);
+                  } catch (e) {
+                    console.warn('[Realtime listener error]', e);
+                  }
+                });
+              } catch (parseErr) {
+                console.warn('[Realtime parse error]', parseErr);
+              }
+            }
+          }
+        )
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            console.log('[Supabase Realtime] Connected to live orders');
+          }
+        });
+    } catch (subErr) {
+      console.warn('[Supabase Realtime subscribe error]', subErr);
+    }
+  }
 
   return () => {
-    supabase.removeChannel(channel);
+    orderListeners.delete(onOrderUpdate);
+    if (orderListeners.size === 0 && globalRealtimeChannel) {
+      try {
+        supabase.removeChannel(globalRealtimeChannel);
+      } catch (e) {
+        console.warn(e);
+      }
+      globalRealtimeChannel = null;
+    }
   };
 }
 

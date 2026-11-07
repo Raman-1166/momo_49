@@ -8,6 +8,7 @@ import { CartPanel } from './components/ui/CartPanel';
 import { AdminPanel } from './components/ui/AdminPanel';
 import { OrderReadyAlert } from './components/ui/OrderReadyAlert';
 import { CartProvider } from './store/cart';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { director } from './lib/director';
 
 function AppInner() {
@@ -156,8 +157,10 @@ function AppInner() {
 
 export default function App() {
   return (
-    <CartProvider>
-      <AppInner />
-    </CartProvider>
+    <ErrorBoundary>
+      <CartProvider>
+        <AppInner />
+      </CartProvider>
+    </ErrorBoundary>
   );
 }

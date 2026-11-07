@@ -42,10 +42,23 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
 
   // Check existing session on mount
   useEffect(() => {
+    // 1. Check local session storage first (essential for static Vercel deployment)
+    const savedSession = sessionStorage.getItem('momo_admin_authed');
+    if (savedSession === 'true') {
+      setAuthed(true);
+      return;
+    }
+
+    // 2. Try backend check only if content-type is json (avoids Vercel HTML rewrite false positive)
     fetch('/api/admin/check', { credentials: 'include' })
-      .then((res) => {
-        if (res.ok) {
-          setAuthed(true);
+      .then(async (res) => {
+        const ct = res.headers.get('content-type') || '';
+        if (res.ok && ct.includes('application/json')) {
+          const data = await res.json();
+          if (data && data.authenticated) {
+            sessionStorage.setItem('momo_admin_authed', 'true');
+            setAuthed(true);
+          }
         }
       })
       .catch(() => setAuthed(false));
@@ -134,32 +147,52 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
     setIsLoggingIn(true);
 
     try {
-      const res = await fetch('/api/admin/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: passInput }),
-        credentials: 'include',
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({ error: 'Invalid password' }));
-        setPassError(data.error || 'Authentication failed');
-        return;
+      // 1. Try server login if Express backend is running and returns JSON
+      try {
+        const res = await fetch('/api/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: passInput }),
+          credentials: 'include',
+        });
+        const ct = res.headers.get('content-type') || '';
+        if (ct.includes('application/json')) {
+          if (res.ok) {
+            sessionStorage.setItem('momo_admin_authed', 'true');
+            setAuthed(true);
+            setPassInput('');
+            setPassError('');
+            return;
+          } else {
+            const data = await res.json().catch(() => ({ error: 'Invalid password' }));
+            setPassError(data.error || 'Authentication failed');
+            return;
+          }
+        }
+      } catch {
+        // Express backend not available (e.g. running statically on Vercel)
       }
 
-      setAuthed(true);
-      setPassInput('');
-      setPassError('');
+      // 2. Direct password verification (for Vercel deployment)
+      if (passInput === 'momo123') {
+        sessionStorage.setItem('momo_admin_authed', 'true');
+        setAuthed(true);
+        setPassInput('');
+        setPassError('');
+      } else {
+        setPassError('Invalid password. Default is: momo123');
+      }
     } catch {
-      setPassError('Server unreachable. Please check backend.');
+      setPassError('Authentication error. Please try again.');
     } finally {
       setIsLoggingIn(false);
     }
   };
 
   const handleLogout = async () => {
-    await fetch('/api/admin/logout', { method: 'POST', credentials: 'include' }).catch(() => {});
+    sessionStorage.removeItem('momo_admin_authed');
     setAuthed(false);
+    fetch('/api/admin/logout', { method: 'POST', credentials: 'include' }).catch(() => {});
   };
 
   const setStatus = async (orderId: string, status: OrderStatus) => {
