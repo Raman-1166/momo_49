@@ -15,8 +15,8 @@ function AppInner() {
   const [sceneReady, setSceneReady] = useState(false);
   const [progress, setProgress] = useState(0);
   const [loaderGone, setLoaderGone] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [cartOpen, setCartOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(() => window.location.hash === '#menu');
+  const [cartOpen, setCartOpen] = useState(() => window.location.hash === '#cart');
   const [cartInitialScreen, setCartInitialScreen] = useState<'cart' | 'confirmed'>('cart');
   const [adminOpen, setAdminOpen] = useState(() => {
     return (
@@ -28,7 +28,7 @@ function AppInner() {
 
   const handleReady = useCallback(() => setSceneReady(true), []);
 
-  // Handle /admin routing without page reloads
+  // Handle /admin, #cart, and #menu routing without page reloads
   useEffect(() => {
     const handleLocation = () => {
       if (
@@ -37,6 +37,13 @@ function AppInner() {
         window.location.search.includes('admin=true')
       ) {
         setAdminOpen(true);
+      } else if (window.location.hash === '#cart') {
+        setMenuOpen(false);
+        setCartInitialScreen('cart');
+        setCartOpen(true);
+      } else if (window.location.hash === '#menu') {
+        setCartOpen(false);
+        setMenuOpen(true);
       }
     };
 
@@ -53,6 +60,20 @@ function AppInner() {
     setAdminOpen(false);
     if (window.location.pathname === '/admin' || window.location.hash === '#admin') {
       window.history.pushState(null, '', '/');
+    }
+  };
+
+  const handleCloseMenu = () => {
+    setMenuOpen(false);
+    if (window.location.hash === '#menu') {
+      window.history.pushState(null, '', window.location.pathname);
+    }
+  };
+
+  const handleCloseCart = () => {
+    setCartOpen(false);
+    if (window.location.hash === '#cart') {
+      window.history.pushState(null, '', window.location.pathname);
     }
   };
 
@@ -137,7 +158,7 @@ function AppInner() {
       {/* Panels — rendered above everything */}
       {menuOpen && (
         <MenuPanel
-          onClose={() => setMenuOpen(false)}
+          onClose={handleCloseMenu}
           onOpenCart={openCart}
           onOpenAdmin={openAdmin}
         />
@@ -145,7 +166,7 @@ function AppInner() {
       {cartOpen && (
         <CartPanel
           initialScreen={cartInitialScreen}
-          onClose={() => setCartOpen(false)}
+          onClose={handleCloseCart}
         />
       )}
       {adminOpen && (
