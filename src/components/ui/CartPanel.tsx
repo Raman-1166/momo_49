@@ -311,6 +311,18 @@ function OrderSuccessScreen({
                 </p>
               </div>
             </div>
+          ) : order.status === 'completed' ? (
+            <div className="rounded-xl border border-green-500/40 bg-[#102915]/80 p-3 flex items-center gap-2.5 text-green-200">
+              <Check size={20} className="text-green-400 shrink-0" />
+              <div>
+                <p className="font-body text-xs font-bold uppercase tracking-wider text-green-400">
+                  Order Picked Up &amp; Completed! 🎉
+                </p>
+                <p className="text-[11px] text-green-200/80">
+                  Thank you for dining with us! Hope you enjoyed the delicious hot momos.
+                </p>
+              </div>
+            </div>
           ) : order.status === 'preparing' ? (
             <div className="rounded-xl border border-yellow-500/40 bg-yellow-950/40 p-2.5 flex items-center gap-2 text-yellow-200 text-xs">
               <Flame size={16} className="text-yellow-400 shrink-0 animate-pulse" />
