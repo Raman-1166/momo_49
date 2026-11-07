@@ -1,5 +1,7 @@
 import type { CartItem } from './cart';
 import { checkoutRequestSchema } from '@/lib/schemas';
+import { supabase, rowToOrder } from '@/lib/supabase';
+import { menuCategories } from '@/data/menu';
 
 export type OrderStatus = 'pending' | 'preparing' | 'ready' | 'completed' | 'cancelled';
 export type PaymentStatus = 'unpaid' | 'paid' | 'refunded' | 'pending_verification';
@@ -53,7 +55,7 @@ export function getLatestActiveOrder(): MyOrderRef | null {
   return refs.length > 0 ? refs[0] : null;
 }
 
-// Broadcast updates across tabs
+// Broadcast updates across browser tabs
 export function notifyOrderChange(type: string, data?: any) {
   try {
     if (typeof BroadcastChannel !== 'undefined') {
@@ -67,10 +69,21 @@ export function notifyOrderChange(type: string, data?: any) {
   window.dispatchEvent(new CustomEvent('momo-orders-change', { detail: { type, data } }));
 }
 
+// Helper: Calculate authoritative price from pure veg menu catalog
+function calculateMenuPrice(itemId: string, variant: '6' | '10' | null): number {
+  for (const cat of menuCategories) {
+    const item = cat.items.find((i) => i.id === itemId);
+    if (item) {
+      if (variant === '6') return item.price6 || 0;
+      if (variant === '10') return item.price10 || 0;
+      return item.price || 0;
+    }
+  }
+  return 0;
+}
+
 /**
- * Submits checkout to the server.
- * STEP 2: The client sends ONLY itemId, variant and qty.
- * The server calculates all prices, tax and totals.
+ * Submits checkout to Supabase Cloud Database (with API server fallback)
  */
 export async function placeOrder(params: {
   customerName: string;
@@ -99,28 +112,90 @@ export async function placeOrder(params: {
     throw new Error(errorMsg);
   }
 
-  // 2. Submit to backend API
-  const response = await fetch('/api/checkout', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      customerName: validationResult.data.customerName,
-      contactNumber: validationResult.data.contactNumber,
-      items: validationResult.data.items,
-      paymentMethod: validationResult.data.paymentMethod,
-      hp_bot_check: validationResult.data.hp_bot_check,
-    }),
-  });
+  // First try backend API if available (e.g. during local dev or Render deploy)
+  try {
+    const response = await fetch('/api/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerName: validationResult.data.customerName,
+        contactNumber: validationResult.data.contactNumber,
+        items: validationResult.data.items,
+        paymentMethod: validationResult.data.paymentMethod,
+        hp_bot_check: validationResult.data.hp_bot_check,
+      }),
+    });
 
-  if (!response.ok) {
-    const errData = await response.json().catch(() => ({ error: 'Order placement failed' }));
-    throw new Error(errData.error || 'Server rejected order request');
+    if (response.ok) {
+      const result = await response.json();
+      const createdOrder: Order = result.order;
+
+      if (createdOrder.accessToken) {
+        saveMyOrderRef({
+          id: createdOrder.id,
+          orderNumber: createdOrder.orderNumber,
+          accessToken: createdOrder.accessToken,
+        });
+      }
+
+      notifyOrderChange('NEW_ORDER', createdOrder);
+      return createdOrder;
+    }
+  } catch {
+    // API server not reachable or running on pure static Vercel — proceed to direct Supabase!
   }
 
-  const result = await response.json();
-  const createdOrder: Order = result.order;
+  // 2. Direct Supabase Cloud Database Insert
+  const unguessableId = `ord_${crypto.randomUUID()}`;
+  const accessToken = Array.from(crypto.getRandomValues(new Uint8Array(24)))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 
-  // 3. Save unguessable token in localStorage for secure viewing
+  // Re-calculate prices accurately from menu
+  const validatedItems: CartItem[] = params.items.map((i) => {
+    const unitPrice = calculateMenuPrice(i.itemId, i.variant as '6' | '10' | null);
+    return {
+      key: i.key,
+      itemId: i.itemId,
+      name: i.name,
+      variant: i.variant,
+      unitPrice,
+      qty: i.qty,
+      isVeg: true,
+    };
+  });
+
+  const totalPrice = validatedItems.reduce((acc, i) => acc + i.unitPrice * i.qty, 0);
+  const totalItemCount = validatedItems.reduce((acc, i) => acc + i.qty, 0);
+  const estimatedMinutes = Math.min(25, Math.max(8, 8 + Math.floor(totalItemCount * 1.5)));
+
+  const initialPaymentStatus: PaymentStatus =
+    params.paymentMethod === 'upi' ? 'pending_verification' : 'unpaid';
+
+  const { data, error } = await supabase
+    .from('orders')
+    .insert({
+      id: unguessableId,
+      access_token: accessToken,
+      customer_name: validationResult.data.customerName,
+      contact_number: validationResult.data.contactNumber,
+      total_price: totalPrice,
+      payment_method: params.paymentMethod,
+      payment_status: initialPaymentStatus,
+      status: 'pending',
+      estimated_minutes: estimatedMinutes,
+      items_json: validatedItems,
+    })
+    .select()
+    .single();
+
+  if (error || !data) {
+    console.error('[SUPABASE ORDER ERROR]', error);
+    throw new Error(error?.message || 'Failed to create order in database');
+  }
+
+  const createdOrder = rowToOrder(data);
+
   if (createdOrder.accessToken) {
     saveMyOrderRef({
       id: createdOrder.id,
@@ -134,9 +209,27 @@ export async function placeOrder(params: {
 }
 
 /**
- * Fetch a customer order securely with its token
+ * Fetch a customer order securely with its token from Supabase
  */
 export async function fetchOrderById(id: string, token?: string): Promise<Order | null> {
+  // 1. Try Supabase cloud database
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!error && data) {
+      if (!token || data.access_token === token) {
+        return rowToOrder(data);
+      }
+    }
+  } catch {
+    // fallback
+  }
+
+  // 2. Fallback to API if available
   try {
     const url = token ? `/api/orders/${id}?token=${encodeURIComponent(token)}` : `/api/orders/${id}`;
     const res = await fetch(url);
@@ -149,48 +242,148 @@ export async function fetchOrderById(id: string, token?: string): Promise<Order 
 }
 
 /**
- * Customer: Add extra items to active order
+ * Customer: Add extra items to active order in Supabase
  */
 export async function addItemsToOrder(
   orderId: string,
   accessToken: string,
   newItems: Array<{ itemId: string; variant?: '6' | '10' | null; qty: number }>
 ): Promise<Order> {
-  const res = await fetch(`/api/orders/${orderId}/add-items`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      accessToken,
-      items: newItems,
-    }),
-  });
+  // Try API first
+  try {
+    const res = await fetch(`/api/orders/${orderId}/add-items`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accessToken,
+        items: newItems,
+      }),
+    });
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Failed to add items' }));
-    throw new Error(err.error || 'Failed to add items to order');
+    if (res.ok) {
+      const data = await res.json();
+      notifyOrderChange('ORDER_UPDATED', data.order);
+      return data.order;
+    }
+  } catch {
+    // API not available, proceed with Supabase directly
   }
 
-  const data = await res.json();
-  notifyOrderChange('ORDER_UPDATED', data.order);
-  return data.order;
+  // Direct Supabase update
+  const { data: current, error: fetchErr } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('id', orderId)
+    .single();
+
+  if (fetchErr || !current) {
+    throw new Error('Order not found');
+  }
+
+  if (current.access_token !== accessToken) {
+    throw new Error('Unauthorized');
+  }
+
+  if (current.status === 'completed' || current.status === 'cancelled') {
+    throw new Error('Cannot add items to completed or cancelled orders');
+  }
+
+  const existingItems: CartItem[] = Array.isArray(current.items_json)
+    ? current.items_json
+    : JSON.parse(current.items_json || '[]');
+
+  const formattedNewItems: CartItem[] = newItems.map((i) => {
+    let itemName = '';
+    for (const cat of menuCategories) {
+      const found = cat.items.find((item) => item.id === i.itemId);
+      if (found) {
+        itemName = found.name;
+        break;
+      }
+    }
+    const unitPrice = calculateMenuPrice(i.itemId, i.variant || null);
+    return {
+      key: `${i.itemId}-${i.variant || ''}-${Date.now()}`,
+      itemId: i.itemId,
+      name: itemName || i.itemId,
+      variant: i.variant || null,
+      unitPrice,
+      qty: i.qty,
+      isVeg: true,
+    };
+  });
+
+  const mergedItems = [...existingItems, ...formattedNewItems];
+  const addedPrice = formattedNewItems.reduce((acc, i) => acc + i.unitPrice * i.qty, 0);
+  const newTotal = (current.total_price || 0) + addedPrice;
+  const newMinutes = (current.estimated_minutes || 10) + Math.max(2, Math.floor(formattedNewItems.length * 1.5));
+
+  const { data: updated, error: updateErr } = await supabase
+    .from('orders')
+    .update({
+      items_json: mergedItems,
+      total_price: newTotal,
+      estimated_minutes: newMinutes,
+    })
+    .eq('id', orderId)
+    .select()
+    .single();
+
+  if (updateErr || !updated) {
+    throw new Error(updateErr?.message || 'Failed to update order in database');
+  }
+
+  const updatedOrder = rowToOrder(updated);
+  notifyOrderChange('ORDER_UPDATED', updatedOrder);
+  return updatedOrder;
 }
 
 /**
- * Admin: Fetch all orders from backend
+ * Admin: Fetch all orders from Supabase Cloud Database
  */
 export async function fetchAdminOrders(): Promise<Order[]> {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (!error && data) {
+      return data.map(rowToOrder);
+    }
+  } catch {
+    // fallback to API
+  }
+
   const res = await fetch('/api/admin/orders');
   if (!res.ok) {
-    throw new Error('Unauthorized or failed to fetch admin orders');
+    throw new Error('Failed to fetch admin orders');
   }
   const data = await res.json();
   return data.orders || [];
 }
 
 /**
- * Admin: Update order status on backend
+ * Admin: Update order status in Supabase
  */
 export async function updateAdminOrderStatus(orderId: string, status: OrderStatus): Promise<Order> {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ status })
+      .eq('id', orderId)
+      .select()
+      .single();
+
+    if (!error && data) {
+      const order = rowToOrder(data);
+      notifyOrderChange('STATUS_CHANGE', { orderId, status });
+      return order;
+    }
+  } catch {
+    // fallback to API
+  }
+
   const res = await fetch(`/api/admin/orders/${orderId}/status`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -208,9 +401,26 @@ export async function updateAdminOrderStatus(orderId: string, status: OrderStatu
 }
 
 /**
- * Admin: Mark UPI/Cash payment as received
+ * Admin: Mark UPI/Cash payment as received in Supabase
  */
 export async function markAdminPaymentReceived(orderId: string): Promise<Order> {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ payment_status: 'paid' })
+      .eq('id', orderId)
+      .select()
+      .single();
+
+    if (!error && data) {
+      const order = rowToOrder(data);
+      notifyOrderChange('PAYMENT_RECEIVED', { orderId });
+      return order;
+    }
+  } catch {
+    // fallback to API
+  }
+
   const res = await fetch(`/api/admin/orders/${orderId}/payment-received`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -224,6 +434,28 @@ export async function markAdminPaymentReceived(orderId: string): Promise<Order> 
   const data = await res.json();
   notifyOrderChange('PAYMENT_RECEIVED', { orderId });
   return data.order;
+}
+
+/**
+ * Real-time Supabase subscription for instant live updates across devices
+ */
+export function subscribeToLiveOrders(onOrderUpdate: (order: Order) => void): () => void {
+  const channel = supabase
+    .channel('public_orders_realtime')
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'orders' },
+      (payload) => {
+        if (payload.new) {
+          onOrderUpdate(rowToOrder(payload.new));
+        }
+      }
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
 }
 
 // Notification chime

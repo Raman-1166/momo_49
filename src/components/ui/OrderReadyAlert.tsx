@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Bell, X, Sparkles } from 'lucide-react';
-import { getMyOrderRefs, fetchOrderById, playChime, type Order } from '@/store/orders';
+import {
+  getMyOrderRefs,
+  fetchOrderById,
+  subscribeToLiveOrders,
+  playChime,
+  type Order,
+} from '@/store/orders';
 
 export function OrderReadyAlert() {
   const [readyOrder, setReadyOrder] = useState<Order | null>(null);
@@ -46,6 +52,20 @@ export function OrderReadyAlert() {
       };
     }
 
+    const unsubscribeSupabase = subscribeToLiveOrders((updated) => {
+      const myRefs = getMyOrderRefs();
+      if (myRefs.some((r) => r.id === updated.id)) {
+        if (updated.status === 'ready') {
+          setReadyOrder((prev) => {
+            if (!prev || prev.id !== updated.id) {
+              playChime(true);
+            }
+            return updated;
+          });
+        }
+      }
+    });
+
     // Periodic check every 8 seconds
     const interval = setInterval(checkMyOrders, 8000);
 
@@ -53,6 +73,7 @@ export function OrderReadyAlert() {
       isMounted = false;
       window.removeEventListener('momo-orders-change', handleEvent);
       channel?.close();
+      unsubscribeSupabase();
       clearInterval(interval);
     };
   }, []);

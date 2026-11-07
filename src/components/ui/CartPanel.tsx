@@ -27,6 +27,7 @@ import {
   fetchOrderById,
   addItemsToOrder,
   getLatestActiveOrder,
+  subscribeToLiveOrders,
   type Order,
 } from '@/store/orders';
 import { menuCategories } from '@/data/menu';
@@ -89,8 +90,16 @@ function OrderSuccessScreen({
       }, 6000);
     }
 
+    // Real-time Supabase push updates
+    const unsubscribeSupabase = subscribeToLiveOrders((updated) => {
+      if (updated.id === order.id) {
+        setOrder(updated);
+      }
+    });
+
     return () => {
       es?.close();
+      unsubscribeSupabase();
       if (pollInterval) clearInterval(pollInterval);
     };
   }, [order.id, order.accessToken]);

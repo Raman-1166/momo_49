@@ -20,6 +20,7 @@ import {
   fetchAdminOrders,
   updateAdminOrderStatus,
   markAdminPaymentReceived,
+  subscribeToLiveOrders,
   playChime,
   type Order,
   type OrderStatus,
@@ -89,11 +90,19 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
       };
     }
 
+    const unsubscribeSupabase = subscribeToLiveOrders((_updated) => {
+      loadOrders();
+      if (audioEnabled) {
+        playChime(false);
+      }
+    });
+
     const interval = setInterval(loadOrders, 5000);
 
     return () => {
       window.removeEventListener('momo-orders-change', handleEvent);
       channel?.close();
+      unsubscribeSupabase();
       clearInterval(interval);
     };
   }, [authed, audioEnabled]);
